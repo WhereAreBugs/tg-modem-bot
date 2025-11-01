@@ -3,14 +3,42 @@ package dbus_mbim
 import (
 	"errors"
 	"fmt"
-	"github.com/godbus/dbus/v5"
 	"log"
 	"strings"
+
+	"github.com/godbus/dbus/v5"
 )
 
+// formatDuration 将秒数转换为人类可读的 Dd Hh Mm Ss 格式
+func formatDuration(totalSeconds uint32) string {
+	if totalSeconds == 0 {
+		return "0s"
+	}
+	d := totalSeconds / 86400
+	h := (totalSeconds % 86400) / 3600
+	m := (totalSeconds % 3600) / 60
+	s := totalSeconds % 60
+
+	var parts []string
+	if d > 0 {
+		parts = append(parts, fmt.Sprintf("%dd", d))
+	}
+	if h > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", h))
+	}
+	if m > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", m))
+	}
+	if s > 0 || len(parts) == 0 {
+		parts = append(parts, fmt.Sprintf("%ds", s))
+	}
+	return strings.Join(parts, " ")
+}
+
+// GetStatus queries the modem for detailed status information.
 func (e *DBusMBIMEngine) GetStatus() (string, error) {
 	if !e.modemPath.IsValid() {
-		return "", errors.New("engine not initialized or modem path is invalid")
+		return "", errors.New("引擎未初始化或 modem path is invalid")
 	}
 
 	modemObj := e.Conn.Object(mmService, e.modemPath)
@@ -19,7 +47,7 @@ func (e *DBusMBIMEngine) GetStatus() (string, error) {
 	// --- 1. Modem State & Network Info ---
 	builder.WriteString("ℹ️ *Modem State*\n")
 
-	// Get basic state from the Modem object
+	// Get basic state from the main Modem interface
 	stateVar, _ := modemObj.GetProperty(modemIface + ".State")
 	if state, ok := stateVar.Value().(int32); ok {
 		stateMap := map[int32]string{
@@ -29,16 +57,7 @@ func (e *DBusMBIMEngine) GetStatus() (string, error) {
 		}
 		builder.WriteString(fmt.Sprintf("`State:` %s\n", stateMap[state]))
 	}
-
-	// Get registration state from the Modem object
-	regStateVar, _ := modemObj.GetProperty(modemIface + ".RegistrationState")
-	if regState, ok := regStateVar.Value().(uint32); ok {
-		regStateMap := map[uint32]string{0: "Idle", 1: "Home", 2: "Searching", 3: "Denied", 4: "Unknown", 5: "Roaming"}
-		builder.WriteString(fmt.Sprintf("`Registration:` %s\n", regStateMap[regState]))
-	}
-
-	// *** 修正核心：从 SIM 对象获取运营商信息 ***
-	// 1. 从 Modem 对象获取 SIM 对象的路径
+	// Get eSIM EID from SIM object
 	simPathVar, err := modemObj.GetProperty(modemIface + ".Sim")
 	if err != nil || !simPathVar.Value().(dbus.ObjectPath).IsValid() {
 		log.Printf("WARN: Could not get active SIM path from modem: %v", err)
@@ -50,8 +69,27 @@ func (e *DBusMBIMEngine) GetStatus() (string, error) {
 		opNameVar, err := simObj.GetProperty("org.freedesktop.ModemManager1.Sim.OperatorName")
 		if err != nil {
 			log.Printf("DEBUG: Could not get OperatorName from SIM object: %v", err)
-		} else if opName, ok := opNameVar.Value().(string); ok && opName != "" {
-			builder.WriteString(fmt.Sprintf("`Operator:` %s\n", opName))
+		}
+		// Get operator name and registration state from the Modem3gpp interface
+		if opname, ok := opNameVar.Value().(string); ok && opname != "" {
+			builder.WriteString(fmt.Sprintf("Esim: %s\n", opname))
+		}
+	}
+	opNameVar1, _ := modemObj.GetProperty("org.freedesktop.ModemManager1.Modem.Modem3gpp.OperatorName")
+	if opName, ok := opNameVar1.Value().(string); ok && opName != "" {
+		builder.WriteString(fmt.Sprintf("`Operator:` %s\n", opName))
+	}
+	regStateVar, _ := modemObj.GetProperty("org.freedesktop.ModemManager1.Modem.Modem3gpp.RegistrationState")
+	if regState, ok := regStateVar.Value().(uint32); ok {
+		regStateMap := map[uint32]string{0: "Idle", 1: "Home", 2: "Searching", 3: "Denied", 4: "Unknown", 5: "Roaming"}
+		builder.WriteString(fmt.Sprintf("`Registration:` %s\n", regStateMap[regState]))
+	}
+
+	// Get access technology from the Modem object
+	techVar, _ := modemObj.GetProperty(modemIface + ".AccessTechnologies")
+	if tech, ok := techVar.Value().(uint32); ok {
+		if techStr := accessTechToString(tech); techStr != "" {
+			builder.WriteString(fmt.Sprintf("`Network Type:` %s\n", techStr))
 		}
 	}
 
@@ -64,11 +102,65 @@ func (e *DBusMBIMEngine) GetStatus() (string, error) {
 		}
 	}
 
+	// Detailed Signal Metrics (robustly check if available)
+	signalDetailsIface := modemIface + ".Signal"
+	if lteVar, err := modemObj.GetProperty(signalDetailsIface + ".Lte"); err == nil && lteVar.Value() != nil {
+		if lteMap, ok := lteVar.Value().(map[string]dbus.Variant); ok && len(lteMap) > 0 {
+			builder.WriteString("*LTE Metrics:*\n")
+			if v, ok := lteMap["rsrp"]; ok {
+				builder.WriteString(fmt.Sprintf("`RSRP:` %.2f dBm\n", v.Value().(float64)))
+			}
+			if v, ok := lteMap["rsrq"]; ok {
+				builder.WriteString(fmt.Sprintf("`RSRQ:` %.2f dB\n", v.Value().(float64)))
+			}
+			if v, ok := lteMap["sinr"]; ok {
+				builder.WriteString(fmt.Sprintf("`SINR:` %.2f dB\n", v.Value().(float64)))
+			}
+			if v, ok := lteMap["rssi"]; ok {
+				builder.WriteString(fmt.Sprintf("`RSSI:` %.2f dB\n", v.Value().(float64)))
+			}
+		}
+	}
+
+	if nrVar, err := modemObj.GetProperty(signalDetailsIface + ".Nr5g"); err == nil && nrVar.Value() != nil {
+		if nrMap, ok := nrVar.Value().(map[string]dbus.Variant); ok && len(nrMap) > 0 {
+			builder.WriteString("*5G NR Metrics:*\n")
+			if v, ok := nrMap["rsrp"]; ok {
+				builder.WriteString(fmt.Sprintf("`RSRP:` %.2f dBm\n", v.Value().(float64)))
+			}
+			if v, ok := nrMap["rsrq"]; ok {
+				builder.WriteString(fmt.Sprintf("`RSRQ:` %.2f dB\n", v.Value().(float64)))
+			}
+			if v, ok := nrMap["sinr"]; ok {
+				builder.WriteString(fmt.Sprintf("`SINR:` %.2f dB\n", v.Value().(float64)))
+			}
+			if v, ok := nrMap["rssi"]; ok {
+				builder.WriteString(fmt.Sprintf("`RSSI:` %.2f dB\n", v.Value().(float64)))
+			}
+		}
+	}
+
+	// Try to get detailed LTE signal metrics
+	lteVar, err := modemObj.GetProperty("org.freedesktop.ModemManager1.Modem.Signal.Lte")
+	if err == nil {
+		if lteMap, ok := lteVar.Value().(map[string]dbus.Variant); ok && len(lteMap) > 0 {
+			// The key for S/N is "snr", not "sinr" based on mmcli output.
+			if v, ok := lteMap["snr"]; ok {
+				if snr, ok := v.Value().(float64); ok {
+					builder.WriteString(fmt.Sprintf("`S/N (SINR):` %.2f dB\n", snr))
+				}
+			}
+		}
+	}
+
 	// --- 3. Data Connection ---
 	builder.WriteString("\n🌐 *Data Connection*\n")
-	ipAddress := e.findIPAddress()
+	ipAddress, onlineDuration := e.findBearerInfo()
 	if ipAddress != "" {
 		builder.WriteString(fmt.Sprintf("`IPv4 Address:` %s\n", ipAddress))
+		if onlineDuration != "" {
+			builder.WriteString(fmt.Sprintf("`Online Duration:` %s\n", onlineDuration))
+		}
 	} else {
 		builder.WriteString("`Status:` Not connected or no IP assigned\n")
 	}
@@ -76,18 +168,17 @@ func (e *DBusMBIMEngine) GetStatus() (string, error) {
 	return builder.String(), nil
 }
 
-// findIPAddress robustly finds the IPv4 address by checking all available bearers.
-func (e *DBusMBIMEngine) findIPAddress() string {
+func (e *DBusMBIMEngine) findBearerInfo() (string, string) {
 	modemObj := e.Conn.Object(mmService, e.modemPath)
 	bearersVar, err := modemObj.GetProperty(modemIface + ".Bearers")
 	if err != nil {
 		log.Printf("ERROR: Could not get bearers list: %v", err)
-		return ""
+		return "", ""
 	}
 
 	bearerPaths, ok := bearersVar.Value().([]dbus.ObjectPath)
 	if !ok || len(bearerPaths) == 0 {
-		return ""
+		return "", ""
 	}
 
 	for _, bearerPath := range bearerPaths {
@@ -99,15 +190,52 @@ func (e *DBusMBIMEngine) findIPAddress() string {
 		if err != nil || ip4ConfigVar.Value() == nil {
 			continue
 		}
-
+		var ipAddress, onlineDuration string
 		if ip4Map, ok := ip4ConfigVar.Value().(map[string]dbus.Variant); ok {
 			if addrVar, ok := ip4Map["address"]; ok {
 				if ip := addrVar.Value().(string); ip != "" {
-					return ip // Found it!
+					ipAddress, ok = addrVar.Value().(string)
+					if !ok {
+						fmt.Printf("Get IP error!")
+					}
 				}
 			}
 		}
+		if ipAddress != "" {
+			statsVar, _ := bearerObj.GetProperty(bearerIface + ".Stats")
+			if statsMap, ok := statsVar.Value().(map[string]dbus.Variant); ok {
+				if durationVar, ok := statsMap["duration"]; ok {
+					onlineDuration = formatDuration(durationVar.Value().(uint32))
+				}
+			}
+			return ipAddress, onlineDuration // Return the first valid bearer's info
+		}
 	}
+	return "", ""
+}
 
-	return ""
+func accessTechToString(tech uint32) string {
+	// Based on MM_MODEM_ACCESS_TECHNOLOGY enum
+	if (tech & (1 << 15)) != 0 { // MM_MODEM_ACCESS_TECHNOLOGY_NR
+		return "5G"
+	}
+	if (tech & (1 << 14)) != 0 { // MM_MODEM_ACCESS_TECHNOLOGY_LTE
+		return "4G (LTE)"
+	}
+	if (tech & (1 << 13)) != 0 { // MM_MODEM_ACCESS_TECHNOLOGY_HSPAP
+		return "3G (HSPA+)"
+	}
+	if (tech & (1 << 12)) != 0 { // MM_MODEM_ACCESS_TECHNOLOGY_HSUPA
+		return "3G (HSUPA)"
+	}
+	if (tech & (1 << 11)) != 0 { // MM_MODEM_ACCESS_TECHNOLOGY_HSDPA
+		return "3G (HSDPA)"
+	}
+	if (tech & (1 << 10)) != 0 { // MM_MODEM_ACCESS_TECHNOLOGY_UMTS
+		return "3G (UMTS)"
+	}
+	if (tech & (1 << 5)) != 0 { // MM_MODEM_ACCESS_TECHNOLOGY_EDGE
+		return "2G (EDGE)"
+	}
+	return "" // Return empty if unknown or lower tech
 }

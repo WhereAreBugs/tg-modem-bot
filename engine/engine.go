@@ -34,3 +34,18 @@ func Get(name string) Engine {
 	}
 	return nil
 }
+
+// ATEngine is an interface for engines that support direct AT command features.
+type ATEngine interface {
+	GetEsimICCID() (string, error)
+	GetEsimStatus() (string, error)
+	GetEsimEID() (string, error)
+	GetEsimPower() (string, error)
+	SetEsimPower(power bool) (string, error)
+	// TODO  Find out other AT-based eSIM commands
+}
+
+// ATSetter is an interface for engines that can accept an AT handler.
+type ATSetter interface {
+	SetATHandler(handler interface{})
+}

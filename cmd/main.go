@@ -10,6 +10,7 @@ import (
 	"tg_modem/commands"
 	_ "tg_modem/commands" // 空导入以执行 commands 包中的 init() 函数
 	"tg_modem/engine"
+	"tg_modem/engine/at"
 	"tg_modem/engine/dbus_mbim"
 	_ "tg_modem/engine/dbus_mbim"
 
@@ -27,6 +28,11 @@ func main() {
 	if adminChatIDStr == "" {
 		log.Fatal("环境变量 ADMIN_CHAT_ID 未设置")
 	}
+	atPortStr := os.Getenv("AT_PORT")
+	if atPortStr == "" {
+		log.Println("WARN:环境变量AT_PORT未设置，使用/dev/wwan0at0.")
+		atPortStr = "/dev/wwan0at0"
+	}
 	adminChatID, err := strconv.ParseInt(adminChatIDStr, 10, 64)
 	if err != nil {
 		log.Fatalf("无效的 ADMIN_CHAT_ID: %v", err)
@@ -40,6 +46,10 @@ func main() {
 
 	if err := eng.Init(); err != nil {
 		log.Fatalf("引擎初始化失败: %v", err)
+	}
+	if s, ok := eng.(engine.ATSetter); ok {
+		log.Printf("Setting AT Handler:%s", atPortStr)
+		s.SetATHandler(at.NewHandler(atPortStr))
 	}
 	log.Println("Modem 引擎初始化成功")
 
